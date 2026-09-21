@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { setTimeout as delay } from "node:timers/promises";
 import { readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -32,8 +33,8 @@ const CHUNK_CONCURRENCY = 2;
 
 class RoutingBudgetError extends Error {}
 
-function fitsEvaluation(state: unknown, questions: unknown) {
-	return Buffer.byteLength(JSON.stringify({ state, questions, providerOptions: {} }), "utf8") <= EVALUATION_BYTES;
+function fitsBudget(state: unknown, questions: unknown, limit = EVALUATION_BYTES) {
+	return Buffer.byteLength(JSON.stringify({ state, questions, providerOptions: {} }), "utf8") <= limit;
 }
 
 const AUTO_THINKING: Record<ModelThinkingLevel, string> = {
@@ -49,7 +50,7 @@ const AUTO_THINKING: Record<ModelThinkingLevel, string> = {
 type ThinkingChoices = Partial<Record<ModelThinkingLevel, string>>;
 type RouteCriteria = { role: string; use_when: string[]; not_for: string[]; boundary: string };
 type RouteOption = { description: string | RouteCriteria; thinking?: ModelThinkingLevel | "auto" | ThinkingChoices; minThinking?: ModelThinkingLevel; adaptiveThinking?: boolean };
-type Config = { options: Record<string, RouteOption>; fallback: string; timeoutMs: number; monitor: boolean; skills: boolean; minThinking?: ModelThinkingLevel };
+type Config = { apiUrl?: string; options: Record<string, RouteOption>; fallback: string; timeoutMs: number; monitor: boolean; skills: boolean; minThinking?: ModelThinkingLevel };
 const DEFAULT_CONFIG: Config = {
 	options: {
 		"openai-codex/gpt-5.6-luna": {
@@ -141,7 +142,16 @@ export function parseConfig(value: unknown): Config {
 	if (typeof monitor !== "boolean") throw new Error("Jev monitor must be a boolean.");
 	const skills = value.skills === undefined ? false : value.skills;
 	if (typeof skills !== "boolean") throw new Error("Jev skills must be a boolean.");
-	return { options, fallback: value.fallback, timeoutMs, monitor, skills, minThinking: parseMinThinking(value.minThinking, "global floor") };
+	let apiUrl: string | undefined;
+	if (value.apiUrl !== undefined) {
+		try {
+			if (typeof value.apiUrl !== "string") throw new Error();
+			const url = new URL(value.apiUrl);
+			if (!["http:", "https:"].includes(url.protocol) || url.username || url.password || url.hash || url.search) throw new Error();
+			apiUrl = url.href;
+		} catch { throw new Error("Jev apiUrl must be an HTTP(S) score endpoint without credentials, query, or fragment."); }
+	}
+	return { options, fallback: value.fallback, timeoutMs, monitor, skills, ...(apiUrl ? { apiUrl } : {}), minThinking: parseMinThinking(value.minThinking, "global floor") };
 }
 
 function thinkingProfiles(model: Model<Api>, route: RouteOption, minimum: ModelThinkingLevel | undefined, inherited: ModelThinkingLevel = "off") {
@@ -231,7 +241,7 @@ export function routingInput(context: Context) {
 	return { key, messages };
 }
 
-function chunkRoutingText(text: string, questions: unknown) {
+function chunkRoutingText(text: string, questions: unknown, limit = EVALUATION_BYTES) {
 	// Code-point offsets keep Unicode intact across both boundaries and overlaps.
 	const characters = Array.from(text);
 	const requestExcerpts = { opening: characters.slice(0, 256).join(""), closing: characters.slice(-256).join("") };
@@ -245,7 +255,7 @@ function chunkRoutingText(text: string, questions: unknown) {
 		let low = start + 1, high = characters.length, end = start;
 		while (low <= high) {
 			const middle = Math.floor((low + high) / 2);
-			if (fitsEvaluation(makeChunk(chunks.length, start, middle), questions)) {
+			if (fitsBudget(makeChunk(chunks.length, start, middle), questions, limit)) {
 				end = middle;
 				low = middle + 1;
 			} else high = middle - 1;
@@ -333,6 +343,48 @@ function skillMessage(loaded: LoadedSkill[]): ContextEvent["messages"][number] {
 	return { role: "custom", customType: "jev-skills", content: `<jev-router-skills>\n${loaded.map((skill) => skill.content).join("\n\n")}\n</jev-router-skills>`, display: false, timestamp: 0 };
 }
 
+export function evaluationFailure(error: unknown) {
+	if (error instanceof Error && error.name === "TimeoutError") return "deadline exceeded";
+	if (isRecord(error) && typeof error.statusCode === "number") return `HTTP ${error.statusCode}${error.statusCode === 422 ? " (input rejected or context limit exceeded)" : error.statusCode === 503 ? " (GPU busy)" : ""}`;
+	if (error instanceof RoutingBudgetError) return "evaluation byte budget exceeded";
+	return "unavailable or invalid response";
+}
+
+export function customEvaluationModel(apiUrl: string): Exclude<Parameters<typeof evaluate>[0]["model"], string> {
+	return {
+		specificationVersion: "v4", provider: "semif", modelId: "custom", supportedQuestionTypes: ["boolean", "choice"],
+		async doEvaluate({ state, questions, abortSignal }) {
+			const answers: Record<string, { type: "boolean"; probability: number } | { type: "choice"; choice: string; probabilities: Record<string, number> }> = {};
+			let inputTokens = 0;
+			// The local GPU accepts one decision at a time. Never return partial answers.
+			for (const [id, question] of Object.entries(questions)) {
+				abortSignal?.throwIfAborted();
+				if (question.type === "score") throw new Error("Custom endpoint does not support score questions.");
+				const criteria = question.type === "boolean" ? { true: question.criteria?.true ?? "True", false: question.criteria?.false ?? "False" } : question.criteria;
+				const options = Object.entries(criteria).map(([id, description]) => ({ id, description: typeof description === "string" ? description : JSON.stringify(description) }));
+				if (options.length < 2 || options.length > 16) throw new Error("Custom endpoint requires 2-16 options.");
+				let response: Response;
+				for (let attempt = 0; ; attempt++) {
+					response = await fetch(apiUrl, { method: "POST", redirect: "error", signal: abortSignal, headers: { "Content-Type": "application/json" }, body: JSON.stringify({ id, state, question: typeof question.instructions === "string" ? question.instructions : JSON.stringify(question.instructions), options }) });
+					if (response.status !== 503 || attempt >= 5) break;
+					await response.body?.cancel();
+					await delay(Math.min(250 * 2 ** attempt, 2000), undefined, { signal: abortSignal });
+				}
+				if (!response.ok) throw Object.assign(new Error("Custom evaluation request failed"), { statusCode: response.status });
+				const result: unknown = await response.json();
+				if (!isRecord(result) || result.id !== id || !Array.isArray(result.option_ids) || JSON.stringify(result.option_ids) !== JSON.stringify(options.map(o => o.id)) || !Array.isArray(result.probabilities) || result.probabilities.length !== options.length || !result.probabilities.every((p: unknown) => typeof p === "number" && Number.isFinite(p) && p >= 0 && p <= 1)) throw new Error("Invalid custom evaluation response.");
+				const probabilities: number[] = result.probabilities;
+				if (Math.abs(probabilities.reduce((a, b) => a + b, 0) - 1) > 1e-6) throw new Error("Invalid probability sum.");
+				if (typeof result.input_tokens !== "number" || !Number.isSafeInteger(result.input_tokens) || result.input_tokens < 0) throw new Error("Invalid custom usage.");
+				inputTokens += result.input_tokens;
+				const best = probabilities.indexOf(Math.max(...probabilities));
+				answers[id] = question.type === "boolean" ? { type: "boolean", probability: probabilities[0] } : { type: "choice", choice: options[best].id, probabilities: Object.fromEntries(options.map((o, i) => [o.id, probabilities[i]])) };
+			}
+			return { answers, usage: { inputTokens, outputTokens: Object.keys(questions).length }, warnings: [] };
+		},
+	};
+}
+
 export default function jevRouter(pi: ExtensionAPI) {
 	const settingsPath = join(getAgentDir(), "settings.json");
 	let content = "{}";
@@ -351,6 +403,15 @@ export default function jevRouter(pi: ExtensionAPI) {
 	if (!isRecord(settings)) throw new Error(`Expected a JSON object in ${settingsPath}.`);
 	const configured = Object.hasOwn(settings, "jevRouter");
 	const config = parseConfig(configured ? settings.jevRouter : DEFAULT_CONFIG);
+	// Byte planning is only a proxy; the local server enforces its exact token limit.
+	const evaluationBytes = config.apiUrl ? 128_000 : EVALUATION_BYTES;
+	const fitsEvaluation = (state: unknown, questions: unknown) => fitsBudget(state, questions, evaluationBytes);
+	async function evaluationModel(ctx: ExtensionContext, signal: AbortSignal) {
+		if (config.apiUrl) return customEvaluationModel(config.apiUrl);
+		const auth = await abortable(() => ctx.modelRegistry.getProviderAuth(GATEWAY), signal);
+		if (!auth?.auth.apiKey) throw new Error("missing Gateway key");
+		return createGateway({ apiKey: auth.auth.apiKey }).evaluationModel("typesafe-ai/jev");
+	}
 	const configSource = configured ? `${settingsPath} (jevRouter)` : "built-in defaults";
 	let active: ExtensionContext | undefined;
 	let pinned: Pin | undefined;
@@ -400,10 +461,8 @@ export default function jevRouter(pi: ExtensionAPI) {
 		const signal = AbortSignal.any([AbortSignal.timeout(config.timeoutMs), ...(ctx.signal ? [ctx.signal] : [])]);
 		try {
 			while (input.messages.length > 1 && !fitsEvaluation({ messages: input.messages }, questions)) input.messages.shift();
-			if (!fitsEvaluation({ messages: input.messages }, questions)) throw new Error("skill evaluation budget exceeded");
-			const auth = await abortable(() => ctx.modelRegistry.getProviderAuth(GATEWAY), signal);
-			if (!auth?.auth.apiKey) throw new Error("missing Gateway key");
-			const model = createGateway({ apiKey: auth.auth.apiKey }).evaluationModel("typesafe-ai/jev");
+			if (!fitsEvaluation({ messages: input.messages }, questions)) throw new RoutingBudgetError("skill evaluation budget exceeded");
+			const model = await evaluationModel(ctx, signal);
 			const result = await abortable(() => evaluate({ model, state: { messages: input.messages }, questions, abortSignal: signal, maxRetries: 0 }), signal);
 			signal.throwIfAborted();
 			const ranked = offered.map((skill, index) => ({ skill, probability: result.answers[String(index)]?.probability }));
@@ -421,9 +480,9 @@ export default function jevRouter(pi: ExtensionAPI) {
 					ctx.ui.notify(`Jev could not load skill ${skill.name}; use the normal skill workflow.`, "warning");
 				}
 			}
-		} catch {
+		} catch (error) {
 			if (ctx.signal?.aborted) return;
-			ctx.ui.notify("Jev skill selection skipped: unavailable, timed out, or over budget. Normal skill loading remains available.", "warning");
+			ctx.ui.notify(`Jev skill selection skipped: ${evaluationFailure(error)}. Normal skill loading remains available.`, "warning");
 		}
 		// Even an empty selection is recorded so tool continuations do not retry.
 		pi.appendEntry("jev-skills", { key: input.key, loaded });
@@ -499,21 +558,19 @@ export default function jevRouter(pi: ExtensionAPI) {
 			};
 			const signal = AbortSignal.any([AbortSignal.timeout(config.timeoutMs), ...(options.signal ? [options.signal] : [])]);
 			try {
-				if (!fitsEvaluation(state, questions)) throw new Error("effort evaluation budget exceeded");
+				if (!fitsEvaluation(state, questions)) throw new RoutingBudgetError("effort evaluation budget exceeded");
 				if (profiles.length === 1) thinking = profiles[0].thinking;
 				else {
-					const auth = await abortable(() => ctx.modelRegistry.getProviderAuth(GATEWAY), signal);
-					if (!auth?.auth.apiKey) throw new Error("missing Gateway key");
-					const model = createGateway({ apiKey: auth.auth.apiKey }).evaluationModel("typesafe-ai/jev");
-					const result = await abortable(() => evaluate({ model, state, questions, abortSignal: signal, maxRetries: 0 }), signal);
+					const model = await evaluationModel(ctx, signal);
+					const result = await abortable(() => evaluate({ model, state, questions, abortSignal: signal, maxRetries: config.apiUrl ? 0 : 2 }), signal);
 					signal.throwIfAborted();
 					const selected = profiles.find((profile) => profile.thinking === result.answers.effort.choice);
 					if (!selected) throw new Error("invalid effort choice");
 					thinking = selected.thinking;
 				}
-			} catch {
+			} catch (error) {
 				options.signal?.throwIfAborted();
-				ctx.ui.notify("Jev effort check failed or exceeded its budget. Keeping the current effort.", "warning");
+				ctx.ui.notify(`Jev effort check failed: ${evaluationFailure(error)}. Keeping the current effort.`, "warning");
 			}
 		}
 		if (!getSupportedThinkingLevels(target).includes(thinking)) throw new Error("The current Astra effort is no longer supported. Fork or select a concrete model.");
@@ -602,12 +659,10 @@ export default function jevRouter(pi: ExtensionAPI) {
 				let chunks: ReturnType<typeof chunkRoutingText> = [];
 				if (!fitsEvaluation({ messages }, questions)) {
 					questions.route.instructions += " For chunk states, assess that section using the bounded request excerpts as context; they may omit instructions elsewhere. Judge the requested work, not just the apparent complexity of pasted reference material. For combined states, assess the task as a whole using every chunk assessment, including minority requirements and possible cross-section dependencies. Do not average scores or take a majority vote: routine sections must not drown out a demanding requirement.";
-					chunks = chunkRoutingText(messages[messages.length - 1].text, questions);
+					chunks = chunkRoutingText(messages[messages.length - 1].text, questions, evaluationBytes);
 					metrics.routingChunks = chunks.length;
 				}
-				const auth = await abortable(() => ctx.modelRegistry.getProviderAuth(GATEWAY), signal);
-				if (!auth?.auth.apiKey) throw new Error("missing Gateway key");
-				const model = createGateway({ apiKey: auth.auth.apiKey }).evaluationModel("typesafe-ai/jev");
+				const model = await evaluationModel(ctx, signal);
 				async function evaluateRequest(state: Parameters<typeof evaluate>[0]["state"]) {
 					if (!fitsEvaluation(state, questions)) throw new RoutingBudgetError("routing request exceeds the evaluation budget");
 					for (let attempt = 1; ; attempt++) {
@@ -635,8 +690,8 @@ export default function jevRouter(pi: ExtensionAPI) {
 				if (!chunks.length) decision = await evaluateRequest({ messages });
 				else {
 					const assessments: { index: number; start: number; end: number; choice: string; probabilities?: Record<string, number> }[] = [];
-					for (let i = 0; i < chunks.length; i += CHUNK_CONCURRENCY) {
-						const pending = chunks.slice(i, i + CHUNK_CONCURRENCY).map(async (state) => {
+					for (let i = 0; i < chunks.length; i += config.apiUrl ? 1 : CHUNK_CONCURRENCY) {
+						const pending = chunks.slice(i, i + (config.apiUrl ? 1 : CHUNK_CONCURRENCY)).map(async (state) => {
 							const answer = await evaluateRequest(state);
 							const { index, start, end } = state.chunk;
 							return { index, start, end, ...answer };
@@ -659,7 +714,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 				// Never expose SDK error bodies: they may contain conversation text.
 				options.signal?.throwIfAborted();
 				const status = isRecord(error) && typeof error.statusCode === "number" ? error.statusCode : undefined;
-				const reason = status === 401 ? "Gateway rejected credentials (401); update the Gateway key" :
+				const reason = config.apiUrl ? (status ? `Custom evaluation failed (HTTP ${status})` : "Custom evaluation unavailable or invalid; check endpoint and connectivity") : status === 401 ? "Gateway rejected credentials (401); update the Gateway key" :
 					status ? `Jev request failed (HTTP ${status})` : "Jev unavailable; check Gateway login/key and connectivity";
 				selection = fallback(error instanceof RoutingBudgetError ? error.message :
 					deadline.aborted || (error instanceof Error && error.name === "TimeoutError") ? "Jev timed out" : reason);
@@ -670,7 +725,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 		}
 		options.signal?.throwIfAborted();
 		checkedKey = key;
-		lastRoute = { ...selection, purpose: pin ? "monitor" : "route", milliseconds: Date.now() - started, estimatedCost: (selection.inputTokens ?? 0) * 0.042 / 1_000_000 };
+		lastRoute = { ...selection, purpose: pin ? "monitor" : "route", milliseconds: Date.now() - started, estimatedCost: config.apiUrl ? 0 : (selection.inputTokens ?? 0) * 0.042 / 1_000_000 };
 		pi.appendEntry(pin ? "jev-monitor" : "jev-route", { ...lastRoute, sessionId, key });
 		if (pin) {
 			if (selection.source === "jev" && selection.target !== pin.target && !suggestedModels.has(selection.target)) {
@@ -793,7 +848,7 @@ export default function jevRouter(pi: ExtensionAPI) {
 		description: "Show the pinned Jev model, current effort, and fork suggestions",
 		handler: async (_args, ctx) => {
 			const routes = Object.entries(config.options).map(([ref, route]) => `${ref}: ${typeof route.thinking === "object" ? `auto (${Object.keys(route.thinking).join(", ")})` : route.thinking ?? "inherit Pi thinking"}${route.minThinking ? `, model minimum ${route.minThinking}` : ""}${route.adaptiveThinking ? ", adaptive" : ""}`).join("\n");
-			const gateway = ctx.modelRegistry.getProviderAuthStatus(GATEWAY).configured ? "configured" : "missing: /login vercel-ai-gateway";
+			const gateway = config.apiUrl ? `unused; custom endpoint: ${config.apiUrl}` : ctx.modelRegistry.getProviderAuthStatus(GATEWAY).configured ? "configured" : "missing: /login vercel-ai-gateway";
 			const pin = pinned ? `${pinned.target}, thinking ${effortEntries(ctx).at(-1)?.thinking ?? pinned.thinking} (initial ${pinned.thinking})` : "not yet selected";
 			const last = lastRoute ? lastRoute.purpose === "monitor" && lastRoute.source === "fallback"
 				? `\nLast monitor failed: ${lastRoute.reason}. Keeping the session pin.`
