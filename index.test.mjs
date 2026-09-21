@@ -588,6 +588,27 @@ test("effort payload preserves headers/settings, rejects incompatible modes, and
 	}
 });
 
+test("structured three-model criteria survive routing and monitoring", async (t) => {
+	const middle = "openai-codex/gpt-5.6-sol";
+	const rubric = { role: "Executor", use_when: ["Known approach"], not_for: ["Architecture"], boundary: "Execute rather than advise" };
+	const config = { options: Object.fromEntries([FAST, middle, DEEP].map(ref => [ref, { description: rubric, thinking: "auto" }])), fallback: DEEP };
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: config }));
+	t.after(() => rmSync(settingsPath, { force: true }));
+	const requests = mockGateway(t, () => ({ target: middle, thinking: "medium" }));
+	const h = await harness({ refs: [FAST, middle, DEEP] });
+	await h.stream().result();
+	assert.equal(h.calls[0].model.id, "gpt-5.6-sol");
+	assert.deepEqual(new Set(Object.values(requests[0].questions.route.criteria).map(p => p.model)), new Set([FAST, middle, DEEP]));
+	await h.stream(context("Next task", 3)).result();
+	for (const request of requests) {
+		for (const profile of Object.values(request.questions.route.criteria)) assert.deepEqual(profile.task, rubric);
+		assert.match(request.questions.route.instructions, /High effort does not expand/);
+	}
+	for (const description of [{}, { ...rubric, use_when: [] }, { ...rubric, not_for: [1] }, { ...rubric, boundary: "" }]) {
+		assert.throws(() => parseConfig({ ...config, options: { [DEEP]: { description } } }), /Invalid Jev route/);
+	}
+});
+
 test("global and model thinking floors constrain routing, monitoring, and fallback without rewriting pins", async (t) => {
 	t.after(() => rmSync(settingsPath, { force: true }));
 	const config = { minThinking: "medium", options: {
@@ -600,6 +621,10 @@ test("global and model thinking floors constrain routing, monitoring, and fallba
 	const h = await harness();
 	await h.stream().result();
 	assert.equal(h.calls[0].options.reasoning, "high");
+	assert.equal(requests.length, 1, "model and effort still use one evaluation");
+	assert.match(requests[0].questions.route.instructions, /model by task fit.*first/);
+	assert.match(requests[0].questions.route.instructions, /Effort levels are model-relative/);
+	assert.match(requests[0].questions.route.instructions, /configured effort floor may exceed/);
 	assert.deepEqual(Object.values(requests[0].questions.route.criteria).map(({ model, thinking }) => [model, thinking]),
 		[[FAST, "high"], [FAST, "xhigh"], [FAST, "max"], [DEEP, "medium"], [DEEP, "high"], [DEEP, "xhigh"], [DEEP, "max"]]);
 	await h.commands.get("jev").handler("", h.ctx);
@@ -609,6 +634,8 @@ test("global and model thinking floors constrain routing, monitoring, and fallba
 	await h.stream(context("Hard task", 3)).result();
 	assert.equal(h.calls.at(-1).options.reasoning, "high");
 	assert.equal(h.entries.find((entry) => entry.name === "jev-suggestion").data.thinking, "medium");
+	assert.match(requests[1].questions.route.instructions, /task fit first/);
+	assert.match(requests[1].questions.route.instructions, /not a reason to fork/);
 	const fallback = await harness({ gatewayKey: false });
 	await fallback.stream().result();
 	assert.equal(fallback.calls[0].options.reasoning, "max");

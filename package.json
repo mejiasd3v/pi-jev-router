@@ -1,6 +1,6 @@
 {
   "name": "pi-jev-router",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Automatic model routing for Pi using TypeSafe's Jev through Vercel AI Gateway",
   "license": "MIT",
   "author": "MejiasDev",

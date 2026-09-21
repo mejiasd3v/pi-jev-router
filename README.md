@@ -53,7 +53,11 @@ Merge `jevRouter` into **global** `~/.pi/agent/settings.json`, then `/reload`:
 
 Only listed, authenticated models are eligible; `fallback` must be listed too. Routes replace the default list; they aren't merged. `PI_CODING_AGENT_DIR` is respected; project settings cannot override routing.
 
-Without configuration, defaults are Luna/`max`, Astra/`xhigh`, Astra fallback, a five-second timeout, and monitoring on. The example above enables automatic effort.
+Without configuration, defaults are Luna/`max`, Sol/`auto`, Astra/`xhigh`, Astra fallback, a five-second timeout, and monitoring on. The example above enables automatic effort.
+
+Descriptions accept either a nonempty string or a structured rubric with `role`, `use_when`, `not_for`, and `boundary`. The role and boundary must be nonempty strings; both lists must contain nonempty strings. Structured rubrics are passed intact as each Choice option's `task`, including during monitoring.
+
+Use Luna for known-approach execution, Sol for bounded investigation and implementation within an established architecture, and Astra for advisory judgment, architecture, critical thinking, and difficult debugging. High effort never expands a model's scope. Sol's middle-tier role should be validated on your workload. Existing string descriptions remain supported.
 
 ### Thinking
 
@@ -64,7 +68,7 @@ Without configuration, defaults are Luna/`max`, Astra/`xhigh`, Astra fallback, a
 | `{"low": "Small changes", "high": "Hard problems"}` | Customize the allowed choices and their descriptions. |
 | Omitted | Inherit Pi's thinking level when the pin is created. |
 
-Levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Automatic choices are filtered to supported levels. Model and effort are chosen together, not in separate evaluations.
+Levels: `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`. Automatic choices are filtered to supported levels. Model and effort are chosen in one evaluation: task fit determines the model first, then Jev selects the lowest sufficient allowed effort within that model. Effort labels are model-relative; another model's lower label does not make it a better fit. A configured floor can intentionally exceed what a routine task needs.
 
 Set `jevRouter.minThinking` for a global floor, and `minThinking` inside a model's option for a stricter per-model floor. For example, global `"medium"` plus Luna `"high"` lets Jev choose medium or higher for Astra and high or higher for Luna when both use `"thinking": "auto"`. An omitted model minimum inherits the global floor. Only `openai-codex/gpt-6-astra` can override it: an explicit Astra `"minThinking": "low"` permits low effort even with global `"medium"`, for both initial routing and adaptive effort. Other models can only raise the global floor. Both fields are optional and default to no additional restriction.
 
