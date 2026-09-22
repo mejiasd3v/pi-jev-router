@@ -18,3 +18,7 @@ jobs:
           node-version: 22.19.0
       - run: nub install --frozen-lockfile --ignore-scripts
       - run: nub run test
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m unittest test_laya_server.py

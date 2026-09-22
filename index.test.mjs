@@ -14,7 +14,7 @@ const piAi = piRequire.resolve.paths("@earendil-works/pi-ai")
 assert.ok(piAi, "Pi's installed pi-ai package must be available");
 const { createJiti } = piRequire("jiti");
 const jiti = createJiti(import.meta.url, { alias: { "@earendil-works/pi-ai": piAi } });
-const { default: extension, parseConfig, routingInput, effortPayload } = await jiti.import("./index.ts");
+const { default: extension, parseConfig, routingInput, effortPayload, customEvaluationModel } = await jiti.import("./index.ts");
 const { convertToLlm } = await jiti.import("@earendil-works/pi-coding-agent");
 const { createAssistantMessageEventStream } = await import(pathToFileURL(piAi));
 // Never read or write the developer's settings.
@@ -117,6 +117,8 @@ async function harness({ refs = [FAST, DEEP], gatewayKey = true, backendError = 
 	};
 }
 
+const liveFetch = globalThis.fetch;
+
 function mockGateway(t, respond = () => FAST) {
 	const previous = globalThis.fetch;
 	const requests = [];
@@ -164,6 +166,42 @@ function mockSkillGateway(t, probabilities = {}) {
 }
 
 const skillContext = (h, messages) => h.handlers.get("context")({ messages }, h.ctx);
+
+test("custom endpoint routes without Gateway credentials and validates answers", async (t) => {
+	configureSkills(t, { apiUrl: "https://local.invalid/score", options: { [FAST]: { description: "Routine" }, [DEEP]: { description: "Complex" } }, fallback: DEEP, skills: false });
+	const previous = globalThis.fetch;
+	t.after(() => { globalThis.fetch = previous; });
+	const requests = [];
+	globalThis.fetch = async (url, options) => {
+		assert.equal(url, "https://local.invalid/score");
+		assert.equal(new Headers(options.headers).has("authorization"), false);
+		assert.equal(options.redirect, "error");
+		const row = JSON.parse(options.body); requests.push(row);
+		return Response.json({ id: row.id, option_ids: row.options.map(o => o.id), probabilities: [0.9, 0.1], input_tokens: 42 });
+	};
+	const h = await harness({ gatewayKey: false });
+	await h.stream().result();
+	assert.equal(h.calls[0].model.id, FAST.split("/")[1]);
+	assert.equal(h.entries.find(e => e.name === "jev-route").data.source, "jev");
+	assert.equal(h.entries.find(e => e.name === "jev-route").data.estimatedCost, 0);
+	assert.equal(requests.length, 1);
+	const model = customEvaluationModel("https://local.invalid/score");
+	const result = await model.doEvaluate({ state: "evidence", questions: { needed: { type: "boolean", instructions: "Needed?", criteria: { true: { description: "yes" }, false: "no" } } } });
+	assert.equal(result.answers.needed.probability, 0.9);
+	assert.equal(requests[1].options[0].description, '{"description":"yes"}');
+	const success = globalThis.fetch;
+	let attempts = 0;
+	globalThis.fetch = async (...args) => ++attempts === 1 ? new Response(null, { status: 503 }) : success(...args);
+	await model.doEvaluate({ state: "x", questions: { retry: { type: "boolean", instructions: "q" } } });
+	assert.equal(attempts, 2);
+	globalThis.fetch = async () => new Response(null, { status: 503 });
+	await assert.rejects(model.doEvaluate({ state: "x", questions: { retry: { type: "boolean", instructions: "q" } }, abortSignal: AbortSignal.timeout(10) }), error => error.name === "AbortError" || error.name === "TimeoutError");
+	globalThis.fetch = async () => Response.json({ id: "needed", option_ids: ["true", "false"], probabilities: [0.8, 0.8], input_tokens: 2 });
+	await assert.rejects(model.doEvaluate({ state: "x", questions: { needed: { type: "boolean", instructions: "q" } } }), /probability sum/);
+	for (const apiUrl of ["file:///tmp/x", "https://user:secret@host/score", "https://host/score?key=x", 42]) {
+		assert.throws(() => parseConfig({ options: { [FAST]: { description: "x" } }, fallback: FAST, apiUrl }), /apiUrl/);
+	}
+});
 
 test("skills are opt-in and work with concrete models without changing routing", async (t) => {
 	const skill = skillFixture("opt-in");
@@ -539,6 +577,19 @@ test("adaptive effort failure and invalid choices retain current effort without 
 	controller.abort();
 	await h.stream(context("Cancelled", 3), { signal: controller.signal }).result();
 	assert.equal(h.calls.length, 1);
+});
+
+test("adaptive effort retries a busy gateway before keeping the current effort", async (t) => {
+	t.after(() => rmSync(settingsPath, { force: true }));
+	writeFileSync(settingsPath, JSON.stringify({ jevRouter: { options: { [DEEP]: { description: "Deep", thinking: "auto", adaptiveThinking: true } }, fallback: DEEP } }));
+	let attempts = 0;
+	const requests = mockGateway(t, () => ++attempts === 1 ? Response.json({ error: "GPU busy" }, { status: 503 }) : "high");
+	const history = [{ name: "jev-pin", data: { target: DEEP, thinking: "medium", sessionId: "main" } }];
+	const h = await harness({ refs: [DEEP], responsesPayload: true, history });
+	await h.stream().result();
+	assert.equal(requests.length, 2);
+	assert.equal(h.calls[0].payload.input.at(-1).reasoning.effort, "high");
+	assert.ok(!h.notices.some(([text]) => text.includes("effort check failed")));
 });
 
 test("adaptive effort cancellation saves no decision and timeout keeps the existing effort", async (t) => {
@@ -1271,4 +1322,22 @@ test("validates config and bounds routing text without sending thinking, tools, 
 	assert.deepEqual(routingInput(rich).messages, [{ role: "assistant", text: "Previous answer" }, { role: "user", text: "Fix a typo" }]);
 	assert.equal(routingInput(context("x".repeat(16001))).messages[0].text.length, 16001);
 	assert.match(routingInput(context("x".repeat(192001))).reason, /routing limit/);
+});
+
+// Opt-in integration test: run laya-server.py, then set LAYA_TEST_URL.
+test("live Laya full routing", { skip: !process.env.LAYA_TEST_URL }, async (t) => {
+ const previous = globalThis.fetch;
+ globalThis.fetch = liveFetch;
+ t.after(() => { globalThis.fetch = previous; });
+ configureSkills(t, { apiUrl: process.env.LAYA_TEST_URL, options: { [FAST]: { description: "Simple edits" }, [DEEP]: { description: "Complex reasoning" } }, fallback: DEEP, skills: false, timeoutMs: 60000 });
+ const h = await harness({ gatewayKey: false });
+ await h.stream(context("Fix a typo in README.md")).result();
+ const route = h.entries.find(e => e.name === "jev-route").data;
+ assert.equal(route.source, "jev");
+ assert.equal(route.target, FAST);
+ const deep = await harness({ gatewayKey: false });
+ await deep.stream(context("Investigate a subtle distributed concurrency bug and evaluate architectural tradeoffs.")).result();
+ const complexRoute = deep.entries.find(e => e.name === "jev-route").data;
+ assert.equal(complexRoute.source, "jev");
+ assert.equal(complexRoute.target, DEEP);
 });

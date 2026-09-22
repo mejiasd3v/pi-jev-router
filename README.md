@@ -59,6 +59,64 @@ Descriptions accept either a nonempty string or a structured rubric with `role`,
 
 Use Luna for known-approach execution, Sol for bounded investigation and implementation within an established architecture, and Astra for advisory judgment, architecture, critical thinking, and difficult debugging. High effort never expands a model's scope. Sol's middle-tier role should be validated on your workload. Existing string descriptions remain supported.
 
+### Local Laya routing
+
+[Laya](https://github.com/NandhaKishorM/laya) provides a Python SDK. The included bridge loads one checkpoint and exposes the scoring protocol used by `jevRouter.apiUrl`:
+
+```sh
+python3 -m venv .venv
+.venv/bin/pip install laya
+.venv/bin/python laya-server.py --port 8765
+```
+
+Set `jevRouter.apiUrl` to `http://127.0.0.1:8765/score` and `/reload`. Run the script from the installed package directory. Python 3.10+ is required; the first launch downloads model weights. `--model` selects another Laya checkpoint. The server binds only to localhost and handles inference serially. No Gateway credentials are required or sent. Generation remains with your configured Pi models; use local generation models for a fully local system.
+
+**Experimental, short-context only:** Laya checkpoints have 512/1024-token contexts and a separate question-header limit. The bridge places the complete policy, option descriptions, and original evidence in the state, using compact option labels in the header. Nothing is silently truncated. Full routing with two short descriptions is live-tested for a typo and a complex debugging task. Larger structured profiles, automatic effort combinations, and long conversations may still exceed the total context; these requests are rejected with HTTP 422. No cloud evaluator is used on failure, but your configured fallback generation model may still be cloud-hosted.
+
+Test the bridge without downloading weights: `python3 -m unittest test_laya_server.py`. Actual inference requires installing Laya and its checkpoint; the unit test does not validate model quality. With the server running, run `LAYA_TEST_URL=http://127.0.0.1:8765/score nub run test` for the opt-in full-router check (real scoring, mocked generation). Two examples do not establish general routing quality.
+
+### Custom SemIf endpoint
+
+[SemIf](https://github.com/TheoLeeCJ/SemIf) was formerly named OpenJev; this is not the separate SiliconLabAI/OpenJev project.
+
+Set `jevRouter.apiUrl` to the full HTTP(S) scoring URL, for example
+`http://127.0.0.1:8765/score`, then `/reload`. This switches model
+routing, monitoring, adaptive effort, and skill selection to SemIf. Omit the
+field to use Gateway again. No Gateway credentials are resolved or sent to the
+custom URL, redirects are rejected, and there is no cloud evaluation fallback.
+Generation still uses your normal Pi provider credentials.
+
+The endpoint receives `{id, state, question, options: [{id, description}]}` and
+must return matching `id`, ordered `option_ids`, normalized `probabilities`, and
+nonnegative integer `input_tokens`. Boolean questions map to true/false options;
+choice questions support 2-16 options. Structured criteria are JSON-serialized.
+Questions and routing chunks run serially for the single-GPU service. All
+answers must succeed; timeout, malformed responses, or HTTP errors preserve
+existing fallback/keep-current-effort/skip-skills behavior. Custom routing cost
+is reported as zero, not Gateway pricing. Evaluation counts represent logical
+calls, which can contain multiple HTTP requests for skill questions.
+
+Conversation evidence described below goes to your custom endpoint instead of
+Vercel/TypeSafe. Use a trusted private endpoint. This adapter has no API-key
+setting; the ailab deployment uses Tailscale access control. URLs containing
+credentials, query strings, or fragments are rejected.
+
+Ailab limits each request to 32768 complete prompt tokens and 1 MiB, with
+separate backend headroom for readout. Custom-endpoint routing uses a 128,000-byte
+planning budget; Gateway keeps 28,000 bytes. Byte budgets are not token counts;
+the server checks exact token counts and rejects oversized requests without
+truncation. This matches Jev's approximate 32K per-question capacity, not its
+64K batched-request protocol or tokenizer.
+Large skill catalogs may exceed `timeoutMs` because each skill is scored
+separately. For the local endpoint, use `"timeoutMs": 60000` to accommodate serial skill
+checks. HTTP 503 responses retry up to five times with bounded backoff within
+the same abort deadline. Warnings distinguish deadline, HTTP status, byte
+budget, and invalid-response failures without exposing conversation text.
+Requests that genuinely exceed the context limit still fail without truncation. Probabilities are uncalibrated and may differ from Jev.
+
+Run `nub smoke-custom.mjs` from this checkout for a live route/Boolean/effort
+check against the configured URL using synthetic evidence only.
+
 ### Thinking
 
 | `thinking` | Behavior |
