@@ -23,9 +23,10 @@ class BridgeTest(unittest.TestCase):
 
         class Agent:
             tok = Tokenizer()
-            cfg = {"max_len": 32, "head_max_len": 24}
+            cfg = {"max_len": 128, "head_max_len": 48}
             def predict(self, state, questions):
                 self.questions = questions
+                self.state = state
                 return {"answers": {"q": {"probabilities": {"a": .3333, "b": .6666}}}, "usage": {"input_tokens": 12}}
 
         agent = Agent()
@@ -34,14 +35,15 @@ class BridgeTest(unittest.TestCase):
             result = bridge.score(agent, request)
             self.assertEqual(result["option_ids"], ["a", "b"])
             self.assertAlmostEqual(sum(result["probabilities"]), 1)
-            self.assertEqual(agent.questions["q"]["criteria"], {"a": "first", "b": "second"})
+            self.assertEqual(agent.questions["q"]["criteria"], {"a": "Option a", "b": "Option b"})
+            self.assertEqual(agent.state, {"policy": "Choose", "options": request["options"], "evidence": "evidence"})
             for field in ("state", "question"):
                 with self.assertRaises(ValueError):
-                    bridge.score(agent, {**request, field: "word " * 50})
+                    bridge.score(agent, {**request, field: "word " * 500})
             with self.assertRaises(ValueError):
                 bridge.score(agent, {**request, "options": [request["options"][0]] * 2})
             with self.assertRaises(ValueError):
-                bridge.score(agent, {**request, "options": [{"id": "a", "description": "word " * 50}, request["options"][1]]})
+                bridge.score(agent, {**request, "options": [{"id": "a", "description": "word " * 500}, request["options"][1]]})
 
 
 if __name__ == "__main__":

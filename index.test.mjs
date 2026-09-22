@@ -117,6 +117,8 @@ async function harness({ refs = [FAST, DEEP], gatewayKey = true, backendError = 
 	};
 }
 
+const liveFetch = globalThis.fetch;
+
 function mockGateway(t, respond = () => FAST) {
 	const previous = globalThis.fetch;
 	const requests = [];
@@ -1320,4 +1322,22 @@ test("validates config and bounds routing text without sending thinking, tools, 
 	assert.deepEqual(routingInput(rich).messages, [{ role: "assistant", text: "Previous answer" }, { role: "user", text: "Fix a typo" }]);
 	assert.equal(routingInput(context("x".repeat(16001))).messages[0].text.length, 16001);
 	assert.match(routingInput(context("x".repeat(192001))).reason, /routing limit/);
+});
+
+// Opt-in integration test: run laya-server.py, then set LAYA_TEST_URL.
+test("live Laya full routing", { skip: !process.env.LAYA_TEST_URL }, async (t) => {
+ const previous = globalThis.fetch;
+ globalThis.fetch = liveFetch;
+ t.after(() => { globalThis.fetch = previous; });
+ configureSkills(t, { apiUrl: process.env.LAYA_TEST_URL, options: { [FAST]: { description: "Simple edits" }, [DEEP]: { description: "Complex reasoning" } }, fallback: DEEP, skills: false, timeoutMs: 60000 });
+ const h = await harness({ gatewayKey: false });
+ await h.stream(context("Fix a typo in README.md")).result();
+ const route = h.entries.find(e => e.name === "jev-route").data;
+ assert.equal(route.source, "jev");
+ assert.equal(route.target, FAST);
+ const deep = await harness({ gatewayKey: false });
+ await deep.stream(context("Investigate a subtle distributed concurrency bug and evaluate architectural tradeoffs.")).result();
+ const complexRoute = deep.entries.find(e => e.name === "jev-route").data;
+ assert.equal(complexRoute.source, "jev");
+ assert.equal(complexRoute.target, DEEP);
 });

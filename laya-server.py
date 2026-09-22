@@ -18,7 +18,10 @@ def score(agent, request):
     keys = [o["id"] for o in options]
     if len(set(keys)) != len(keys):
         raise ValueError("Duplicate options")
-    question = {"type": "choice", "instructions": request["question"], "criteria": {o["id"]: o["description"] for o in options}}
+    # Laya limits the question header independently of the full context. Put
+    # complete policy and option descriptions in evidence, without truncation.
+    state = {"policy": request["question"], "options": options, "evidence": request["state"]}
+    question = {"type": "choice", "instructions": "Choose the option that best fits the evidence and policy.", "criteria": {key: "Option " + key for key in keys}}
     internal = {"t": "choice", "ins": question["instructions"], "crit": question["criteria"]}
     # Mirror Laya's formatter limits, rejecting every kind of silent truncation.
     def length(text):
@@ -26,10 +29,10 @@ def score(agent, request):
     option_lengths = [length(" " + text) for text in render_options(internal)]
     head = length("choice question: " + question["instructions"])
     budget = agent.cfg.get("head_max_len", 192) - sum(n + 1 for n in option_lengths)
-    total = head + sum(n + 1 for n in option_lengths) + length(serialize_state(request["state"])) + 4
+    total = head + sum(n + 1 for n in option_lengths) + length(serialize_state(state)) + 4
     if max(option_lengths) > 48 or budget < 16 or head > budget or total > agent.cfg.get("max_len", 512):
         raise ValueError("Request exceeds Laya context or criteria limits; use shorter evidence and descriptions")
-    result = agent.predict(request["state"], {request["id"]: question})
+    result = agent.predict(state, {request["id"]: question})
     distribution = result["answers"][request["id"]]["probabilities"]
     probabilities = [distribution[key] for key in keys]
     if any(not isinstance(p, (float, int)) or not math.isfinite(p) or not 0 <= p <= 1 for p in probabilities) or not 0 < sum(probabilities):
